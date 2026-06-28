@@ -1,815 +1,471 @@
 ---
-name: g4f-style-recon
-description: Metodologi reverse-engineering website AI seperti gpt4free â€” untuk menemukan endpoint API tersembunyi, bypass auth, dan mengintegrasikan provider AI gratis tanpa API key resmi. Gunakan ketika user ingin "test web AI ini", "coba reverse engineer", "cari endpoint gratis", atau membangun provider AI baru.
+name: web-recon-endpoint-finder
+description: Metodologi reverse-engineering website umum — untuk menemukan endpoint API tersembunyi, mekanisme auth, struktur data, dan cara mengintegrasikan layanan web apapun (bukan hanya AI). Gunakan ketika user ingin "cari endpoint website ini", "reverse engineer", "scrape API", "integrasi tanpa SDK resmi", atau "cari cara akses data dari website X".
 ---
 
-# G4F-Style AI Website Recon
+# Web Recon & Endpoint Finder
 
-Metodologi ini terinspirasi dari [gpt4free](https://github.com/xtekky/gpt4free) â€” project Python yang mengumpulkan endpoint AI gratis dari berbagai website dengan cara merekayasa balik request browser mereka.
+Metodologi ini terinspirasi dari pendekatan gpt4free namun **berlaku untuk semua jenis website** — e-commerce, media sosial, berita, fintech, travel, AI, SaaS, dan lainnya. Tujuannya: menemukan bagaimana sebuah website berkomunikasi dengan backend-nya, lalu mereplikasi komunikasi tersebut secara programatik.
 
-## âš ï¸ ATURAN WAJIB â€” Standar "Setara OpenAI untuk AI Agent Otonom"
+---
 
-Setiap provider yang diimplementasikan **WAJIB** mendukung seluruh fitur berikut agar setara dengan OpenAI resmi dan kompatibel dengan AI agent otonom (Manus, AutoGPT, CrewAI, LangChain, dll):
+## ⚠️ ATURAN WAJIB
 
-| Fitur | Wajib | Keterangan |
-|---|---|---|
-| **Streaming SSE** | âœ… WAJIB | `stream: true` kirim SSE chunks OpenAI-format |
-| **Non-streaming** | âœ… WAJIB | `stream: false` return JSON lengkap |
-| **Tool / Function calling** | âœ… WAJIB | Deteksi JSON `{"tool_calls":[...]}` dari output model via `detectToolCalls()` â€” **wajib di streaming DAN non-streaming** |
-| **Streaming tool_calls SSE** | âœ… WAJIB | Streaming dengan tools: buffer full response â†’ detectToolCalls â†’ emit SSE `tool_calls` events (bukan text chunks). Format identik Qwen |
-| **Multi-tool parallel** | âœ… WAJIB | Satu response bisa return lebih dari 1 tool call |
-| **Tool results loop** | âœ… WAJIB | `role: "tool"` di messages harus di-handle di `messagesToPrompt()` |
-| **Vision / Image** | âœ… WAJIB | Kalau provider native support â†’ kirim langsung. Kalau tidak â†’ pakai `flattenVisionMessages()` sebagai fallback via Qwen |
-| **System prompt** | âœ… WAJIB | |
-| **JSON mode** | âœ… WAJIB | `response_format: {type: "json_object"}` inject instruksi JSON ke system |
-| **`finish_reason`** | âœ… WAJIB | `"stop"`, `"length"`, `"tool_calls"` |
-| **Token usage lengkap** | âœ… WAJIB | `prompt_tokens`, `completion_tokens`, `total_tokens` + `prompt_tokens_details: {cached_tokens: 0, audio_tokens: 0}` + `completion_tokens_details: {reasoning_tokens: 0, audio_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0}` |
-| **`max_tokens` + `max_completion_tokens`** | âœ… WAJIB | Support keduanya via `applyMaxTokens()` â€” **wajib di streaming DAN non-streaming** |
-| **`stop` sequences** | âœ… WAJIB | Post-process via `applyStop()` â€” **wajib di streaming DAN non-streaming** |
-| **`temperature`, `top_p`** | âœ… WAJIB | Kirim ke provider kalau didukung, ignore kalau tidak |
-| **`stream_options.include_usage`** | âœ… WAJIB | Kirim `sseUsageChunk()` di akhir SSE kalau `includeUsage === true` |
-| **`n > 1` validation** | âœ… WAJIB | Return `400` dengan `unsupported_value` jika `n > 1` â€” sudah di-handle global di v1.ts, tidak perlu per-provider |
-| **Model capabilities metadata** | âœ… WAJIB | Entry di `MODELS[]` dengan `capabilities: {vision, tools, json_mode, streaming}` dan `context_window` |
-
-**TIDAK BOLEH** menambah provider yang hanya support chat biasa tanpa tool calling dan streaming â€” itu tidak berguna untuk AI agent otonom.
-
-**TIDAK BOLEH** implementasi setengah-setengah â€” semua fitur di atas wajib ada sekaligus, baik di streaming maupun non-streaming path. Jangan skip usage details, stop sequences, atau tool detection di salah satu path.
+1. **Hanya untuk tujuan legal** — scraping/recon untuk riset, integrasi pribadi, atau reverse-engineering yang diizinkan ToS.
+2. **Jangan bypass paywall berbayar** tanpa izin eksplisit pemilik layanan.
+3. **Hormati rate limit** — jangan buat request berlebihan yang bisa membebani server target.
+4. **Tidak untuk credential stuffing** atau akses akun orang lain.
 
 ---
 
 ## Alur Kerja (Urutan Wajib)
 
-### FASE 1 â€” Profiling Website
+### FASE 1 — Profiling Awal Website
 
 ```bash
-# 1. Cek headers & cookies website
-curl -s -I "https://target.ai/" \
+TARGET="https://target.com"
+
+# 1. Cek headers server — dapat info: tech stack, CDN, security headers
+curl -s -I "$TARGET" \
   -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36" \
   --max-time 10
 
 # 2. Probe endpoint umum sekaligus
-for ep in "/v1/models" "/api/models" "/api/v1/models" "/api/config" \
-          "/v1/chat/completions" "/api/chat/completions" "/auth/login" \
-          "/api/v1/auths/" "/openai/v1/chat/completions"; do
-  code=$(curl -s -o /dev/null -w "%{http_code}" "https://target.ai$ep" \
+for ep in \
+  "/api" "/api/v1" "/api/v2" "/v1" "/v2" \
+  "/api/config" "/config.json" "/manifest.json" "/.well-known/openid-configuration" \
+  "/graphql" "/gql" "/query" \
+  "/api/auth" "/auth" "/login" "/api/login" "/api/session" \
+  "/api/user" "/api/me" "/api/profile" \
+  "/api/search" "/search" \
+  "/api/data" "/data" \
+  "/sitemap.xml" "/robots.txt" \
+  "/swagger.json" "/openapi.json" "/api-docs" "/docs/api"; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" "$TARGET$ep" \
     -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" --max-time 8 2>/dev/null)
-  echo "$code  $ep"
+  [ "$code" != "404" ] && echo "$code  $ep"
 done
 ```
 
 **Interpretasi kode HTTP:**
-- `200` = endpoint terbuka, test langsung
-- `401` = endpoint ada, butuh auth â€” cari cara dapat token
-- `403` = ada tapi blocked â€” coba bypass header
-- `404` = tidak ada di path ini â€” coba variasi lain
-- `405` = Method Not Allowed â€” coba method berbeda (GET/POST)
-- `307/302` = redirect â€” follow redirectnya
+| Kode | Arti | Tindakan |
+|---|---|---|
+| `200` | Terbuka | Test langsung |
+| `401` | Ada, butuh auth | Cari token/session |
+| `403` | Ada, diblokir | Coba bypass header |
+| `404` | Tidak ada | Coba variasi path lain |
+| `405` | Method salah | Ganti GET↔POST |
+| `307/302` | Redirect | Follow redirect-nya |
+| `429` | Rate limited | Tambah delay / rotasi IP |
+| `500` | Server error | Endpoint ada tapi payload salah |
 
-### FASE 2 â€” Ekstrak Endpoint dari Source JS
+---
 
-```bash
-# Ambil HTML dan cari file JS bundle utama
-curl -s "https://target.ai/" | grep -oE 'src="[^"]+\.js"' | head -5
-
-# Download JS bundle dan cari pattern endpoint
-JS_URL="https://cdn.target.ai/assets/index-XXXX.js"
-curl -s "$JS_URL" --max-time 30 | grep -oE '"(/api[^"]{0,80})"' | sort -u | head -30
-
-# Cari fetch() calls dengan endpoint
-curl -s "$JS_URL" --max-time 30 | grep -oE 'fetch\(`[^`]{0,100}`' | head -20
-
-# Cari pola chat/completions
-curl -s "$JS_URL" --max-time 30 | grep -oE '\$\{[a-zA-Z_]+\}/[a-z/]+completions' | head -10
-
-# Cari base URL variable (biasanya: WEBUI_BASE_URL, apiUrl, baseUrl, dll)
-curl -s "$JS_URL" --max-time 30 | grep -oE 'WEBUI_BASE_URL[^,;]{0,100}' | head -5
-```
-
-### FASE 3 â€” Cari Mekanisme Auth
-
-**Pola auth yang umum ditemukan:**
-
-#### A. Guest/Anonymous Token (paling bagus â€” tanpa registrasi)
-```bash
-# Open WebUI style â€” GET auth endpoint auto-buat guest account
-curl -s "https://target.ai/api/v1/auths/" \
-  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" \
-  -H "Accept: application/json"
-# Kalau dapat token â†’ langsung pakai sebagai Bearer token
-```
-
-#### B. Login Email/Password
-```bash
-curl -s -X POST "https://target.ai/api/v1/auths/signin" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@example.com","password":"testpass123"}'
-```
-
-#### C. Cookie-Based (browser session)
-```bash
-# Simpan cookie dari login
-curl -s -c /tmp/cookies.txt "https://target.ai/login" \
-  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0"
-# Gunakan cookie untuk request berikutnya
-curl -s -b /tmp/cookies.txt "https://target.ai/api/chat/completions" ...
-```
-
-#### D. Tanpa Auth Sama Sekali (Perplexity, PollinationsAI style)
-```bash
-# Langsung test endpoint dengan Chrome headers lengkap + TLS 1.3
-curl -s -X POST "https://target.ai/api/endpoint" \
-  --tlsv1.3 \
-  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36" \
-  -H "Origin: https://target.ai" \
-  -H "Referer: https://target.ai/" \
-  -H "Accept: text/event-stream" \
-  -H "Content-Type: application/json" \
-  -d '{"...":"..."}'
-```
-
-### FASE 4 â€” Test Chat Completion
-
-Setelah dapat token/cookie:
+### FASE 2 — Identifikasi Tech Stack
 
 ```bash
-TOKEN="..."
+TARGET="https://target.com"
 
-# Non-streaming test
-curl -s -X POST "https://target.ai/ENDPOINT" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" \
-  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"say hi in one sentence"}],"stream":false}' \
-  --max-time 30
+# Dari headers HTTP
+curl -sI "$TARGET" | grep -iE "server|x-powered-by|x-framework|cf-ray|x-vercel|x-amz"
 
-# Streaming test
-curl -s -X POST "https://target.ai/ENDPOINT" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"say hi"}],"stream":true}' \
-  --max-time 30 | head -50
+# Dari HTML meta tags
+curl -s "$TARGET" | grep -iE '<meta[^>]+(generator|framework|version)[^>]+>'
+
+# Dari robots.txt — sering ada path yang terbuka
+curl -s "$TARGET/robots.txt"
+
+# Dari HTML — cari link ke JS bundle
+curl -s "$TARGET" | grep -oE 'src="[^"]+\.(js|mjs)"' | head -10
+curl -s "$TARGET" | grep -oE "src='[^']+\.(js|mjs)'" | head -10
+
+# Dari HTML — cari link API/backend hints
+curl -s "$TARGET" | grep -oE '"(https?://[^"]{0,100}api[^"]{0,100})"' | sort -u | head -20
 ```
 
-### FASE 5 â€” Test Tool Calling
+**Tanda-tanda tech stack:**
+- `x-powered-by: Next.js` → Next.js, cek `/_next/static/` dan `__NEXT_DATA__`
+- `x-powered-by: Express` → Node.js Express
+- `cf-ray` header → Cloudflare, gunakan `--tlsv1.3`
+- `x-vercel-id` → Vercel hosting
+- `X-Amz-*` → AWS, mungkin ada S3 bucket publik
+- Nuxt.js → cek `__nuxt` di HTML
+- Django → cek `/admin/`, CSRF token pattern
 
-Provider wajib support tool calling. Kalau native tidak support, pakai prompt injection + `detectToolCalls()` (lihat implementasi di `v1.ts` â†’ `injectToolPrompt()`):
+---
+
+### FASE 3 — Ekstrak Endpoint dari Source JS
+
+Ini adalah teknik paling efektif untuk SPA (Single Page App).
 
 ```bash
-# Test apakah provider bisa return JSON tool call format
-TOKEN="..."
-curl -s -X POST "https://target.ai/ENDPOINT" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"MODEL_ID",
-    "messages":[{"role":"user","content":"What is the weather in Jakarta? You must call the get_weather tool.\n\n{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Jakarta\"}}]}"}],
-    "stream":false
-  }' --max-time 30
-# Kalau model return format {"tool_calls":[...]} â†’ native tool calling bisa dipakai
-# Kalau tidak â†’ pakai injectToolPrompt() + detectToolCalls() (prompt injection)
+TARGET="https://target.com"
+
+# A. Dapatkan daftar JS bundle dari HTML
+JS_FILES=$(curl -s "$TARGET" | grep -oE '"(/[^"]+\.(js|mjs))"' | tr -d '"' | sort -u)
+echo "$JS_FILES"
+
+# B. Cari endpoint dari setiap JS bundle
+for JS in $JS_FILES; do
+  JS_URL="$TARGET$JS"
+  echo "=== $JS_URL ==="
+
+  # Cari semua path /api/... dan /v1/...
+  curl -s "$JS_URL" --max-time 30 | grep -oE '"(/api[^"]{0,100})"' | sort -u | head -20
+  curl -s "$JS_URL" --max-time 30 | grep -oE '"(/v[0-9][^"]{0,100})"' | sort -u | head -20
+
+  # Cari fetch() dan axios calls
+  curl -s "$JS_URL" --max-time 30 | grep -oE 'fetch\("([^"]{0,100})"\)' | head -15
+  curl -s "$JS_URL" --max-time 30 | grep -oE "axios\.(get|post|put|delete)\(['\"]([^'\"]{0,100})" | head -15
+
+  # Cari base URL variable
+  curl -s "$JS_URL" --max-time 30 | grep -oE '(BASE_URL|API_URL|apiUrl|baseUrl|ENDPOINT)[^,;]{0,100}' | head -10
+
+  # Cari template literal endpoint
+  curl -s "$JS_URL" --max-time 30 | grep -oE '`\$\{[a-zA-Z_]+\}/[a-z/_-]{0,60}`' | head -10
+done
+
+# C. Untuk CDN-hosted bundle (URL berbeda dari domain utama)
+CDN_JS="https://cdn.target.com/assets/index-XXXX.js"
+curl -s "$CDN_JS" --max-time 30 \
+  | grep -oE '"(/[a-z/_-]{2,80})"' | sort -u | head -40
 ```
 
-### FASE 6 â€” Identifikasi Format Response & Vision Support
-
-**Format SSE (Server-Sent Events) â€” paling umum untuk streaming:**
-```
-event: message
-data: {"choices":[{"delta":{"content":"Hello"}}]}
-
-event: message
-data: [DONE]
-```
-
-**Format OpenAI-compatible (paling mudah):**
-```json
-{"choices":[{"message":{"role":"assistant","content":"Hello!"}}]}
-```
-
-**Format custom (contoh Perplexity):**
-```json
-{"blocks":[{"diff_block":{"field":"markdown_block","patches":[{"value":{"answer":"Hello..."}}]}}]}
-```
-
-**Cek apakah provider support vision (kirim image_url):**
+**Teknik tambahan untuk Next.js:**
 ```bash
-curl -s -X POST "https://target.ai/ENDPOINT" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":[
-    {"type":"text","text":"What is in this image?"},
-    {"type":"image_url","image_url":{"url":"https://picsum.photos/200"}}
-  ]}],"stream":false}' --max-time 30
-# 200 dengan konten = native vision support
-# Error/ignored = tidak support â†’ wajib pakai flattenVisionMessages() fallback
+# __NEXT_DATA__ di HTML berisi props awal + config API
+curl -s "$TARGET" | grep -oE '<script id="__NEXT_DATA__"[^>]*>([^<]+)<' | head -1
+
+# Next.js API routes — coba enumerasi
+for ep in "/api/auth/session" "/api/auth/providers" "/api/trpc" "/api/hello"; do
+  curl -s -o /dev/null -w "%{http_code}  $ep\n" "$TARGET$ep" --max-time 5
+done
 ```
 
 ---
 
-## Checklist Perlindungan yang Sering Ditemui
+### FASE 4 — Analisis dengan Browser DevTools (Panduan Manual)
+
+Ketika curl tidak cukup, gunakan DevTools browser:
+
+```
+1. Buka website target di Chrome/Firefox
+2. F12 → tab "Network"
+3. Filter: "Fetch/XHR" (untuk API calls saja)
+4. Lakukan aksi yang ingin di-recon (search, login, scroll, klik tombol)
+5. Klik request yang menarik → lihat:
+   - Headers tab: URL, Method, Request Headers (auth, cookies)
+   - Payload tab: Request body (JSON/FormData)
+   - Response tab: Format response JSON
+6. Klik kanan request → "Copy as cURL" → paste ke terminal untuk replay
+
+Untuk GraphQL:
+- Filter by "graphql" di search box Network
+- Lihat tab Payload → operationName, query/mutation string, variables
+- Copy as cURL dan replay
+
+Untuk WebSocket:
+- Filter "WS" di Network tab
+- Lihat tab Messages untuk protocol & format pesan
+```
+
+---
+
+### FASE 5 — Mekanisme Auth
+
+#### A. Session/Cookie Biasa
+```bash
+# Login dan simpan cookie
+curl -s -c /tmp/cookies.txt -X POST "$TARGET/api/login" \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" \
+  -d '{"email":"user@example.com","password":"password123"}'
+
+# Gunakan cookie untuk request berikutnya
+curl -s -b /tmp/cookies.txt "$TARGET/api/protected-resource" \
+  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0"
+```
+
+#### B. Bearer Token (JWT)
+```bash
+# Login dapat token
+TOKEN=$(curl -s -X POST "$TARGET/api/auth/signin" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"pass"}' \
+  | grep -oE '"token":"([^"]+)"' | cut -d'"' -f4)
+
+echo "Token: $TOKEN"
+
+# Decode JWT tanpa library (lihat payload)
+echo "$TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+
+# Gunakan token
+curl -s "$TARGET/api/user/profile" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### C. Guest/Anonymous (tanpa registrasi)
+```bash
+# Banyak website buat session anonim otomatis
+curl -s "$TARGET/api/session" \
+  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" \
+  -H "Accept: application/json"
+
+# Atau via guest login
+curl -s -X POST "$TARGET/api/auth/guest" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+#### D. OAuth / SSO
+```bash
+# Cek /.well-known/openid-configuration
+curl -s "$TARGET/.well-known/openid-configuration" | python3 -m json.tool
+
+# Atau ambil authorization_url dari login page
+curl -s "$TARGET/login" | grep -oE 'https://[^"]+oauth[^"]+' | head -5
+```
+
+#### E. API Key di Header
+```bash
+# Cari di JS bundle
+curl -s "JS_BUNDLE_URL" | grep -oE '(x-api-key|apikey|api_key|X-Client-ID)[^,;]{0,80}' | head -10
+
+# Test dengan API key dari bundle
+curl -s "$TARGET/api/endpoint" \
+  -H "X-API-Key: KEY_DARI_JS_BUNDLE"
+```
+
+#### F. HMAC / Signature (website yang lebih protektif)
+```bash
+# Cari di JS bundle — cari fungsi sign/hmac/signature
+curl -s "JS_BUNDLE_URL" | grep -oE '(hmac|HMAC|signature|sign)\([^)]{0,200}\)' | head -10
+
+# Cari secret key yang digunakan
+curl -s "JS_BUNDLE_URL" | grep -oE '"(secret|SECRET|key|KEY)":\s*"[^"]{10,64}"' | head -5
+```
+
+---
+
+### FASE 6 — Analisis Format Request & Response
+
+```bash
+# Setelah dapat token/cookie, test endpoint utama
+TOKEN="..."
+COOKIE="session=abc123"
+
+# GET request
+curl -s "$TARGET/api/endpoint" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" \
+  | python3 -m json.tool | head -50
+
+# POST dengan JSON
+curl -s -X POST "$TARGET/api/endpoint" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" \
+  -d '{"key":"value"}' \
+  | python3 -m json.tool | head -50
+
+# POST dengan Form data
+curl -s -X POST "$TARGET/api/endpoint" \
+  -H "Cookie: $COOKIE" \
+  -F "field1=value1" \
+  -F "field2=value2"
+
+# GraphQL
+curl -s -X POST "$TARGET/graphql" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operationName": "GetUser",
+    "query": "query GetUser { me { id name email } }",
+    "variables": {}
+  }' | python3 -m json.tool
+
+# WebSocket test (pakai websocat jika tersedia)
+# websocat "wss://target.com/ws" --header "Authorization: Bearer $TOKEN"
+```
+
+---
+
+### FASE 7 — Test Streaming Response
+
+```bash
+# SSE (Server-Sent Events)
+curl -s -X POST "$TARGET/api/stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"test"}' \
+  --max-time 30 | head -30
+
+# NDJSON (Newline-Delimited JSON)
+curl -s "$TARGET/api/live-feed" \
+  -H "Authorization: Bearer $TOKEN" \
+  --max-time 10 | head -5 | python3 -m json.tool
+
+# Chunked transfer encoding
+curl -s --raw "$TARGET/api/chunked" --max-time 10 | head -20
+```
+
+---
+
+### FASE 8 — Bypass Proteksi Umum
 
 | Proteksi | Cara Bypass |
 |---|---|
-| Cloudflare | Pakai `--tlsv1.3` + Chrome User-Agent |
-| Captcha signup | Cari endpoint guest/anonymous tanpa captcha |
-| `X-Signature` / HMAC | Reverse-engineer dari JS bundle |
-| Rate limiting | Rotasi UUID/session per request |
-| IP block | Tidak bisa bypass dari server |
-| Token expiry | Re-fetch token tiap request atau cache TTL pendek |
-| Hotlink protection gambar | Gunakan curl dengan Referer + Chrome UA (sudah handled di `fetchImageBytes()`) |
+| **Cloudflare** | `--tlsv1.3` + Chrome User-Agent + Origin/Referer header |
+| **Rate limiting** | Tambah delay `sleep 1`, rotasi UUID/session, atau gunakan pool session |
+| **CORS** | Buat proxy server lokal (tidak bisa bypass dari browser, bisa dari server) |
+| **Captcha login** | Cari endpoint guest/anonim yang tidak butuh captcha |
+| **X-Signature / HMAC** | Reverse-engineer dari JS bundle, temukan secret + algoritma signing |
+| **Hotlink protection gambar** | Tambah header `Referer: https://target.com/` + Chrome UA |
+| **Token expiry** | Cache token + deteksi 401 → refresh otomatis |
+| **User-Agent detection** | Gunakan Chrome UA terbaru: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36` |
+| **IP geofencing** | Proxy atau VPS di region yang diizinkan |
+| **Fingerprinting TLS** | Gunakan curl dengan `--tlsv1.3` atau impersonasi Chrome via library |
+| **Anti-bot (bot score)** | Tambah header `sec-ch-ua`, `sec-fetch-*`, `Accept-Language` seperti browser nyata |
 
----
-
-## Provider yang Sudah Terimplementasi
-
-### 1. Qwen (Provider Utama â€” Native Vision)
-- **File:** `artifacts/api-server/src/lib/umid-pool.ts` + logic di `v1.ts`
-- **Auth:** Pool 2000 `bx-umidtoken` (rotasi round-robin), auto-refresh
-- **Vision:** âœ… Native â€” upload ke Qwen OSS via STS token + HMAC-SHA1, semua model Qwen support
-- **Image fetch:** `fetchImageBytes()` di `v1.ts` â€” pakai Node.js fetch dulu, fallback ke curl untuk hotlink-protected URL (Wikipedia, Cloudflare, dll)
-- **Tools:** âœ… Via prompt injection `injectToolPrompt()` + `detectToolCalls()`
-- **Streaming:** âœ… Native SSE dari chat.qwen.ai, parse `output_schema: "answer"` chunks
-- **Models:** `qwen3.7-max`, `qwen3.6-plus`, `qwen3.6-max-preview`, `qwen3-235b-a22b`, `qwen3-30b-a3b`, `qwen-max-latest`, `qwen-turbo-latest`, `qwen2.5-coder-32b-instruct`, `qwen-vl-max-latest`, `qwen2.5-vl-72b-instruct`
-- **Catatan:** Model alias panjang di `MODEL_ALIASES{}` â€” hampir semua nama model OpenAI/Qwen di-map ke model yang tersedia
-
-### 2. Opera Aria
-- **File:** `artifacts/api-server/src/lib/aria-provider.ts`
-- **Auth:** 2 tahap â€” step 1 dapat `authToken`, step 2 tukar ke `access_token`. **KRITIS: step 2 HARUS tanpa User-Agent header**
-- **Vision:** âš¡ Fallback â€” gambar dianalisis Qwen dulu via `flattenVisionMessages()`, hasilnya dikirim sebagai teks
-- **Tools:** âœ… Via prompt injection
-- **Streaming:** âœ… Via `execSync` curl (bukan Node.js fetch) karena masalah TLS fingerprint
-- **Model ID:** `aria`
-
-### 3. Yqcloud
-- **File:** `artifacts/api-server/src/lib/yqcloud-provider.ts`
-- **Auth:** Tidak perlu â€” pool 200 `userId` UUID rotasi round-robin
-- **Endpoint:** `POST https://api.binjie.fun/api/generateStream`
-- **Vision:** âš¡ Fallback via `flattenVisionMessages()`
-- **Tools:** âœ… Via prompt injection
-- **Streaming:** âœ… Response body adalah plain text stream (bukan SSE), langsung pipe
-- **Models:** `yqcloud`, `yqcloud-gpt4`
-
-### 4. Cohere (via HuggingFace Space)
-- **File:** `artifacts/api-server/src/lib/cohere-provider.ts`
-- **Auth:** Tidak perlu â€” HuggingFace public space. Pool 10 conversation slot per model, rotasi untuk spread rate limit
-- **Endpoint:** `https://coherelabs-c4ai-command.hf.space`
-- **Vision:** âš¡ Fallback via `flattenVisionMessages()`
-- **Tools:** âœ… Via prompt injection
-- **Streaming:** âœ… Via async generator, parse `{type:"stream", token:"..."}` chunks
-- **Models:** `command-a`, `command-a-03-2025`, `command-r-plus`, `command-r`, `command-r7b`
-
-### 5. Perplexity AI
-- **File:** `artifacts/api-server/src/lib/perplexity-provider.ts`
-- **Auth:** Tidak perlu â€” guest mode tanpa akun
-- **Endpoint:** `POST https://www.perplexity.ai/rest/sse/perplexity_ask` (underscore, bukan hyphen)
-- **Vision:** âš¡ Fallback via `flattenVisionMessages()`
-- **Tools:** âœ… Via prompt injection
-- **Streaming:** âœ… Via execSync curl dengan `--tlsv1.3`, parse SSE `data:` events, field `answer` dari `patches[].value`
-- **Models:** `perplexity` (alias ke `turbo`)
-- **Rate limit:** ~15â€“20 req/hari per IP, reset 00:00 UTC
-- **Catatan:** Hanya `model_preference: "turbo"` atau `"default"` yang berfungsi tanpa auth
-
-### 7. AlgoChat (Gemini 3 Flash Preview)
-- **File:** `artifacts/api-server/src/lib/algochat-provider.ts`
-- **Auth:** Guest session via cookie â€” `POST /api/session` â†’ dapat `algochat_session` + `algochat_user` cookie (TTL ~4 jam, cache di `/tmp/algochat_session_cookies.txt`)
-- **Flow per request:** `ensureSession()` â†’ `POST /api/create-chat` (buat chatId baru) â†’ `POST /api/chat`
-- **Endpoint chat:** `POST https://algochat.app/api/chat`
-- **Payload WAJIB:**
-  ```json
-  {
-    "messages": [{"id":"msg-0","role":"user","content":"...","parts":[{"type":"text","text":"..."}]}],
-    "chatId": "uuid-from-create-chat",
-    "model": "google/gemini-3-flash-preview",
-    "webSearchEnabled": false
-  }
-  ```
-  âš ï¸ **KRITIS:** Field `parts` wajib ada di setiap message â€” tanpanya server return 500 "Cannot read properties of undefined (reading 'map')"
-- **Response format:** Vercel AI SDK Data Stream Protocol â€” parse `{"type":"text-delta","delta":"..."}` events
-- **Vision:** âš¡ Fallback via `flattenVisionMessages()`
-- **Tools:** âœ… Via prompt injection
-- **Models:** `algochat`, `gemini-3-flash-preview`
-- **Streaming:** âœ… Via execSync curl, parse Vercel AI SDK stream
-- **Catatan:** Referer header `https://algochat.app/chat/{chatId}` wajib disertakan
-
-### 6. GPTFree
-- **File:** `artifacts/api-server/src/lib/gptfree-provider.ts`
-- **Auth:** Firebase anonymous auth (tanpa akun) â€” auto-renew token
-- **Endpoint:** `https://us-central1-gptfree-2.cloudfunctions.net/agent_stream`
-- **Vision:** âš¡ Fallback via `flattenVisionMessages()`
-- **Tools:** âœ… Via prompt injection
-- **Streaming:** âœ… SSE `event:result` chunks
-- **Payload:** `{ message, images:[], history:[{type, content}] }`
-- **Models:** `gptfree`
-
-### 8. Kimi (Moonshot AI via Connect RPC)
-- **File:** `artifacts/api-server/src/lib/kimi-provider.ts`
-- **Auth:** JWT dari `kimi-auth` cookie â†’ simpan di `KIMI_TOKEN` env var. Parse field `sub`, `device_id`, `ssid` dari JWT untuk headers.
-- **Endpoint:** `POST https://www.kimi.com/apiv2/kimi.gateway.chat.v1.ChatService/Chat`
-- **Protocol:** Connect RPC binary framing â€” request dan response WAJIB pakai 5-byte envelope (1 byte flags + 4 byte length BE + JSON body)
-- **Vision:** âš¡ Fallback via `flattenVisionMessages()`
-- **Tools:** âœ… Via prompt injection
-- **Streaming:** âœ… AsyncGenerator â€” parse Connect RPC frames dari reader loop, yield tiap token saat tiba
-- **Models:** `kimi-k2`, `kimi-search`, `kimi-research`
-- **Scenarios:** `SCENARIO_K2` (default), `SCENARIO_SEARCH`, `SCENARIO_RESEARCH`, `SCENARIO_K1`
-- **âš ï¸ LIMITASI PENTING â€” Web Search via kimi-search/kimi-research:**
-  Saat kamu chat langsung di kimi.com, backend Kimi mendeteksi tag `<search>`, mengeksekusi web search server-side, lalu hasilnya dikembalikan ke model (hasil akurat + real-time). Via Connect RPC langsung, infrastruktur search ini **tidak dijalankan** â€” model hanya output tag `<search>` / `<<tool>web_search</tool>` sebagai teks, lalu menjawab berdasarkan training knowledge (bukan data real-time).
-  **Solusi:** `cleanKimiOutput()` di `kimi-provider.ts` otomatis strip semua internal tags (`<search>`, `<<tool>`, `<<query>`, dll) agar output tetap bersih. Tapi datanya tetap dari training, bukan web search nyata.
-
----
-
-## Standar Interface Wajib â€” SEMUA Provider HARUS Sama
-
-Setiap provider file **wajib** mengekspor 4 hal berikut dengan nama dan signature yang konsisten:
-
-```typescript
-// 1. Tipe message (export â€” dipakai v1.ts)
-export interface ChatMessage { role: string; content: string; }
-
-// 2. Daftar model
-export const PROVIDER_MODELS = [
-  { id: "model-id", object: "model", created: 1700000000, owned_by: "provider" },
-];
-
-// 3. Cek apakah model ini milik provider
-export function isProviderModel(model: string): boolean {
-  return PROVIDER_MODELS.some(m => m.id === model);
-}
-
-// 4a. Streaming â€” AsyncGenerator<string> (BUKAN Promise<Readable>, BUKAN callback)
-export async function* providerStream(
-  messages: ChatMessage[],
-  model = "default-model",
-): AsyncGenerator<string> { /* ... yield token */ }
-
-// 4b. Non-streaming â€” WAJIB return inputTokens + outputTokens
-export async function providerChat(
-  messages: ChatMessage[],
-  model = "default-model",
-): Promise<{ content: string; inputTokens: number; outputTokens: number }> {
-  let content = "";
-  for await (const token of providerStream(messages, model)) content += token;
-  const trimmed = content.trim();
-  return {
-    content: trimmed,
-    inputTokens: Math.round(messages.map(m => m.content).join("").length / 4),
-    outputTokens: Math.round(trimmed.length / 4),
-  };
-}
-```
-
-**Aturan interface wajib:**
-- Stream harus `AsyncGenerator<string>` â€” **BUKAN** `Promise<Readable>` dan **BUKAN** callback-based
-- Chat harus return `{ content, inputTokens, outputTokens }` â€” tiga field, tidak boleh hanya `{ content }`
-- Kedua fungsi harus menerima `(messages: ChatMessage[], model?)` â€” urutan param wajib sama
-- `PROVIDER_MODELS` harus di-spread ke `MODELS[]` di v1.ts, bukan hardcoded
-- `isProviderModel` wajib digunakan di v1.ts, bukan `model === "nama"` hardcoded
-
-**Status konsistensi semua provider saat ini (Juni 2026):**
-
-| Provider | `MODELS` export | `isModel()` | `stream(msgs,model)` AsyncGen | `chat(msgs,model)` + tokenCounts |
-|---|---|---|---|---|
-| **Aria** | âœ… `ARIA_MODELS` | âœ… `isAriaModel` | âœ… `ariaStream` | âœ… `ariaChat` |
-| **Yqcloud** | âœ… `YQCLOUD_MODELS` | âœ… `isYqcloudModel` | âœ… `yqcloudStream` | âœ… `yqcloudChat` |
-| **Cohere** | âœ… `COHERE_MODELS` | âœ… `isCohereModel` | âœ… `cohereStream` | âœ… `cohereChat` |
-| **Perplexity** | âœ… `PERPLEXITY_MODELS` | âœ… `isPerplexityModel` | âœ… `perplexityStream` | âœ… `perplexityChat` |
-| **GPTFree** | âœ… `GPTFREE_MODELS` | âœ… `isGptfreeModel` | âœ… `gptfreeStream` | âœ… `gptfreeChat` |
-| **AlgoChat** | âœ… `ALGOCHAT_MODELS` | âœ… `isAlgochatModel` | âœ… `algochatStream` | âœ… `algochatChat` |
-| **Kimi** | âœ… `KIMI_MODELS` | âœ… `isKimiModel` | âœ… `kimiStream` | âœ… `kimiChat` |
-
----
-
-## Template Implementasi Provider Lengkap (Node.js/TypeScript)
-
-Gunakan template ini sebagai dasar setiap provider baru. **Semua bagian wajib diisi.**
-
-```typescript
-// artifacts/api-server/src/lib/{nama}-provider.ts
-
-import { execSync } from "child_process";
-import { logger } from "./logger";
-
-export interface ChatMessage { role: string; content: string; }
-
-// â”€â”€ Token/Session cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-let cachedToken: string | null = null;
-let tokenExpiry = 0;
-
-async function getToken(): Promise<string> {
-  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-  const resp = await fetch("https://target.ai/api/v1/auths/", {
-    headers: { "User-Agent": "Mozilla/5.0 Chrome/138.0.0.0" }
-  });
-  const data = await resp.json() as { token: string };
-  cachedToken = data.token;
-  tokenExpiry = Date.now() + 3600_000;
-  return cachedToken!;
-}
-
-// â”€â”€ Streaming (AsyncGenerator â€” WAJIB, bukan Promise<Readable>) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-export async function* providerStream(
-  messages: ChatMessage[],
-  model = "default-model",
-): AsyncGenerator<string> {
-  const token = await getToken();
-  const body = JSON.stringify({ model, messages, stream: true });
-
-  const raw = execSync(
-    `curl -sN -X POST "https://target.ai/v1/chat/completions" \
-      -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: application/json" \
-      -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" \
-      --tlsv1.2 --max-time 120 \
-      -d '${body.replace(/'/g, "'\\''")}'`,
-    { maxBuffer: 20 * 1024 * 1024 },
-  ).toString();
-
-  for (const line of raw.split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    const data = line.slice(6).trim();
-    if (data === "[DONE]") break;
-    try {
-      const json = JSON.parse(data);
-      const content = json.choices?.[0]?.delta?.content ?? "";
-      if (content) yield content;
-    } catch { /* skip malformed */ }
-  }
-}
-
-// â”€â”€ Non-streaming (WAJIB return inputTokens + outputTokens) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-export async function providerChat(
-  messages: ChatMessage[],
-  model = "default-model",
-): Promise<{ content: string; inputTokens: number; outputTokens: number }> {
-  let content = "";
-  for await (const token of providerStream(messages, model)) content += token;
-  const trimmed = content.trim();
-  return {
-    content: trimmed,
-    inputTokens: Math.round(messages.map(m => m.content).join("").length / 4),
-    outputTokens: Math.round(trimmed.length / 4),
-  };
-}
-
-// â”€â”€ Model list (WAJIB export, jangan hardcode di v1.ts) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-export const PROVIDER_MODELS = [
-  { id: "provider-model-1", object: "model", created: 1700000000, owned_by: "provider" },
-  { id: "provider-model-2", object: "model", created: 1700000000, owned_by: "provider" },
-];
-
-export function isProviderModel(model: string): boolean {
-  return PROVIDER_MODELS.some(m => m.id === model);
-}
-```
-
----
-
-## Cara Integrasi ke v1.ts (Wajib Ikuti Pola Ini)
-
-Setelah provider selesai, integrasi ke `artifacts/api-server/src/routes/v1.ts`:
-
-### 1. Import di atas file
-```typescript
-import { chatProvider, streamProvider, isProviderModel, PROVIDER_MODELS } from "../lib/nama-provider";
-```
-
-### 2. Tambah ke MODELS[] dengan capabilities (wajib)
-```typescript
-const MODELS: ModelEntry[] = [
-  // ... provider lain ...
-  ...PROVIDER_MODELS.map(m => ({
-    ...m,
-    capabilities: {
-      vision: false,    // true kalau native vision, false kalau hanya fallback
-      tools: true,      // selalu true (via prompt injection)
-      json_mode: false, // true kalau reliable
-      streaming: true,  // selalu true
-    },
-    context_window: 32768,  // sesuaikan dengan limit provider
-  })),
-];
-```
-
-### 3. Tambah route di chat/completions â€” **POLA WAJIB LENGKAP**
-
-```typescript
-// Di bagian try{} di router.post("/chat/completions", ...)
-// Letakkan SEBELUM blok Qwen provider
-
-if (isProviderModel(model)) {
-  // Vision fallback â€” wajib untuk provider tanpa native vision
-  const provEffective = hasImages ? await flattenVisionMessages(effectiveMessages) : effectiveMessages;
-  const provMessages = provEffective.map(m => ({
-    role: m.role,
-    content: typeof m.content === "string" ? m.content : getMessageText(m.content),
-  }));
-
-  // â”€â”€ STREAMING PATH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  if (stream) {
-    startSSE();
-
-    // WAJIB: Buffer full response terlebih dahulu, baru proses
-    // Jangan pipe token langsung â€” harus buffer untuk tool detection + stop sequences
-    let provCollected = "";
-    try {
-      for await (const token of streamProvider(provMessages, model)) {
-        if (token) provCollected += token;
-      }
-    } catch (err: unknown) {
-      logger.warn({ err }, "provider: stream error");
-    }
-
-    // WAJIB: Terapkan max_tokens dan stop sequences setelah collect
-    const provSsMt = applyMaxTokens(provCollected, _max);
-    const provSsSt = applyStop(provSsMt.content, _stop);
-    const provFinalText = provSsSt.content;
-    const provStreamFinish = (provSsMt.truncated || provSsSt.truncated) ? "length" : "stop";
-    const provPromptEst = estimateTokens(messagesToPrompt(provMessages));
-    const provOutEst = Math.round(provFinalText.length / 4);
-
-    // WAJIB: Deteksi tool calls â€” emit SSE tool_calls events (bukan text)
-    if (hasTools) {
-      const provStreamToolCalls = detectToolCalls(provFinalText);
-      if (provStreamToolCalls) {
-        res.write(sseChunk({ role: "assistant", content: null }));
-        for (let i = 0; i < provStreamToolCalls.length; i++) {
-          const tc = provStreamToolCalls[i];
-          res.write(sseChunk({ tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] }));
-          const args = tc.function.arguments;
-          for (let j = 0; j < args.length; j += 20) {
-            res.write(sseChunk({ tool_calls: [{ index: i, function: { arguments: args.slice(j, j + 20) } }] }));
-          }
-        }
-        if (includeUsage) res.write(sseUsageChunk(provPromptEst, provOutEst));
-        res.write(sseChunk({}, "tool_calls"));
-        res.write("data: [DONE]\n\n");
-        res.end();
-        return;
-      }
-    }
-
-    // Normal text streaming â€” emit word-by-word
-    res.write(sseChunk({ role: "assistant", content: "" }));
-    for (const w of provFinalText.split(/(\s+)/)) {
-      if (w) res.write(sseChunk({ content: w }));
-    }
-    if (includeUsage) res.write(sseUsageChunk(provPromptEst, provOutEst));
-    res.write(sseChunk({}, provStreamFinish));
-    res.write("data: [DONE]\n\n");
-    res.end();
-    return;
-  }
-
-  // â”€â”€ NON-STREAMING PATH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  const { content: provRaw, inputTokens: provIn, outputTokens: provOut } = await chatProvider(provMessages, model);
-  if (!provRaw) {
-    res.status(502).json({ error: { message: "No response from provider", type: "upstream_error", code: "empty_response" } });
-    return;
-  }
-
-  // WAJIB: Terapkan max_tokens dan stop sequences
-  const provMt = applyMaxTokens(provRaw, _max);
-  const provSt = applyStop(provMt.content, _stop);
-  const provContent = provSt.content;
-  const provFinish = (provMt.truncated || provSt.truncated) ? "length" : "stop";
-
-  // WAJIB: Usage lengkap dengan details (bukan hanya 3 field)
-  const provUsage = {
-    prompt_tokens: provIn,
-    completion_tokens: provOut,
-    total_tokens: provIn + provOut,
-    prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
-    completion_tokens_details: { reasoning_tokens: 0, audio_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0 },
-  };
-
-  // WAJIB: Deteksi tool calls
-  const provToolCalls = hasTools ? detectToolCalls(provContent) : null;
-  if (provToolCalls) {
-    res.json({ id, object: "chat.completion", created, model: _rawModel, service_tier: "default",
-      system_fingerprint: "fp_provider_gateway",
-      choices: [{ index: 0, message: { role: "assistant", refusal: null, content: null, tool_calls: provToolCalls }, logprobs: null, finish_reason: "tool_calls" }],
-      usage: provUsage });
-    return;
-  }
-  res.json({ id, object: "chat.completion", created, model: _rawModel, service_tier: "default",
-    system_fingerprint: "fp_provider_gateway",
-    choices: [{ index: 0, message: { role: "assistant", refusal: null, content: provContent }, logprobs: null, finish_reason: provFinish }],
-    usage: provUsage });
-  return;
-}
-```
-
-### 4. Tambah model ke Playground UI â€” **WAJIB, BUKAN OPSIONAL**
-
-File: `artifacts/gateway/src/pages/playground.tsx` â€” array `WORKING_MODELS` di bagian atas file.
-
-```typescript
-// Tambahkan entry baru di WORKING_MODELS sesuai nama group provider
-// â”€â”€ NamaProvider (deskripsi singkat) â”€â”€
-{ id: "model-id",       label: "model-id (deskripsi)", group: "NamaGroup" },
-{ id: "model-alias",    label: "model-alias",           group: "NamaGroup" },
-```
-
-**Aturan wajib:**
-- Setiap model ID yang ada di `PROVIDER_MODELS` (provider file) **harus ada** di `WORKING_MODELS` (playground)
-- Nama `group` harus konsisten dan deskriptif (contoh: `"AlgoChat"`, `"Perplexity"`, `"GPTFree"`)
-- Label boleh menyertakan keterangan singkat dalam kurung, contoh: `"algochat (Gemini 3 Flash Preview)"`
-- Setelah edit playground, restart workflow `artifacts/gateway: web` agar perubahan aktif
-
-**Tanpa update ini, provider dianggap belum selesai** â€” user tidak bisa memilih model di UI.
-
----
-
-> **Kenapa buffer dulu di streaming?**
-> Tool calling via prompt injection menghasilkan JSON di akhir output. Kalau langsung pipe token-by-token ke client, JSON `{"tool_calls":[...]}` ikut terkirim sebagai text biasa dan tidak bisa dideteksi. Dengan buffer â†’ detect â†’ emit ulang sebagai SSE `tool_calls` events, client (OpenAI SDK, LangChain, dll) menerima format yang benar.
-
----
-
-## Checklist Sebelum Provider Dianggap Selesai
-
-Sebelum commit, jalankan **semua** test di bawah ini. Provider dianggap selesai hanya jika **semua** lulus. Tidak ada pengecualian.
-
+**Header browser lengkap untuk bypass fingerprinting:**
 ```bash
-APIKEY="sk-..."
-MODEL="NAMA_MODEL"
-BASE="http://localhost:8080"
-
-# â”€â”€ 1. Non-streaming basic â€” cek ada content & usage lengkap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"say hi in one word\"}]}" \
-  | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
-      const j=JSON.parse(d);
-      const u=j.usage||{};
-      console.log('[content]', j.choices?.[0]?.message?.content);
-      console.log('[finish_reason]', j.choices?.[0]?.finish_reason);
-      console.log('[usage keys]', Object.keys(u).join(', '));
-      console.log('[has prompt_tokens_details]', 'prompt_tokens_details' in u);
-      console.log('[has completion_tokens_details]', 'completion_tokens_details' in u);
-    })"
-# LULUS: content berisi teks, finish_reason=stop, usage punya 5 keys termasuk details
-
-# â”€â”€ 2. Streaming â€” cek SSE text chunks dan finish chunk â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}]}" \
-  | grep -E "finish_reason|content" | tail -3
-# LULUS: ada chunks dengan content, baris terakhir finish_reason: "stop"
-
-# â”€â”€ 3. Stop sequences â€” streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":true,\"stop\":[\"3\"],\"messages\":[{\"role\":\"user\",\"content\":\"count from 1 to 10 one per line\"}]}" \
-  | grep "finish_reason" | tail -1
-# LULUS: finish_reason: "length" (berhenti sebelum selesai)
-
-# â”€â”€ 4. max_tokens â€” non-streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":false,\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":\"write a long story\"}]}" \
-  | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
-      const j=JSON.parse(d);
-      console.log('[finish_reason]', j.choices?.[0]?.finish_reason);
-      console.log('[completion_tokens]', j.usage?.completion_tokens);
-    })"
-# LULUS: finish_reason=length, completion_tokens <= 10 (estimasi ~2x max_tokens)
-
-# â”€â”€ 5. Tool calling â€” non-streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Jakarta? Call get_weather.\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}}}]}" \
-  | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
-      const j=JSON.parse(d);
-      const ch=j.choices?.[0];
-      console.log('[finish_reason]', ch?.finish_reason);
-      console.log('[has tool_calls]', !!(ch?.message?.tool_calls));
-      console.log('[content is null]', ch?.message?.content===null);
-    })"
-# LULUS: finish_reason=tool_calls, has tool_calls=true, content is null=true
-
-# â”€â”€ 6. Tool calling â€” streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Jakarta? Call get_weather.\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}}}]}" \
-  | grep -E "tool_calls|finish_reason" | head -5
-# LULUS: ada baris dengan tool_calls (bukan text biasa), finish_reason: "tool_calls"
-
-# â”€â”€ 7. Vision â€” gambar publik â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What is in this image?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://picsum.photos/seed/cat/200\"}}]}]}" \
-  | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{console.log(JSON.parse(d).choices?.[0]?.message?.content?.slice(0,100));})"
-# LULUS: ada deskripsi gambar (via flattenVisionMessages fallback kalau tidak native)
-
-# â”€â”€ 8. Vision â€” URL hotlink-protected (Wikipedia) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What animal is this?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/481px-Cat03.jpg\"}}]}]}" \
-  | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{console.log(JSON.parse(d).choices?.[0]?.message?.content?.slice(0,80));})"
-# LULUS: menyebut "cat" atau "kucing"
-
-# â”€â”€ 9. Model muncul di /v1/models dengan capabilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s $BASE/v1/models -H "Authorization: Bearer $APIKEY" \
-  | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
-      const j=JSON.parse(d);
-      const m=j.data.find(x=>x.id.includes('$MODEL'));
-      console.log('[found]', !!m);
-      console.log('[capabilities]', JSON.stringify(m?.capabilities));
-    })"
-# LULUS: found=true, capabilities punya vision/tools/json_mode/streaming
-
-# â”€â”€ 10. n > 1 â€” sudah di-handle global, verifikasi saja â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-curl -s -X POST $BASE/v1/chat/completions \
-  -H "Authorization: Bearer $APIKEY" -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"n\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
-  | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{console.log(JSON.parse(d).error?.code);})"
-# LULUS: "unsupported_value"
-```
-
-**Provider dianggap SELESAI jika semua 10 test di atas LULUS** DAN model sudah muncul di Playground UI. Kalau ada 1 test gagal atau model belum ada di Playground, provider belum boleh di-commit.
-
-### âœ… Checklist Final â€” Semua wajib terpenuhi sebelum commit
-
-| # | Item | Cara verifikasi |
-|---|---|---|
-| 1â€“10 | Semua test API lulus | Jalankan test bash di atas |
-| 11 | Model ada di `WORKING_MODELS` playground | Cek `artifacts/gateway/src/pages/playground.tsx` |
-| 12 | Model muncul di dropdown UI Playground | Buka `/playground` di browser, cek selector |
-| 13 | Entry di SKILL.md provider list diupdate | Tambah di seksi "Provider yang Sudah Diimplementasikan" |
-
----
-
-## Contoh Nyata â€” Recon & Status
-
-### Perplexity AI (belum diimplementasi)
-```bash
-# Endpoint: POST https://www.perplexity.ai/rest/sse/perplexity_ask
-# KRITIS: underscore (_), bukan hyphen (-)
-curl -s -X POST "https://www.perplexity.ai/rest/sse/perplexity_ask" \
+curl -s "$TARGET/api/endpoint" \
   --tlsv1.3 \
-  -H "accept: text/event-stream" \
-  -H "content-type: application/json" \
-  -H "origin: https://www.perplexity.ai" \
-  -H "referer: https://www.perplexity.ai/" \
-  -H "user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36" \
-  -H "x-perplexity-request-reason: perplexity-query-state-provider" \
-  -H "x-request-id: $(cat /proc/sys/kernel/random/uuid)" \
-  -d '{
-    "params": {
-      "attachments": [], "language": "en-US", "timezone": "America/Los_Angeles",
-      "search_focus": "internet", "sources": ["web"],
-      "frontend_uuid": "UUID-DISINI", "mode": "copilot",
-      "model_preference": "turbo", "is_related_query": false,
-      "frontend_context_uuid": "CTX-UUID-DISINI",
-      "prompt_source": "user", "query_source": "home",
-      "use_schematized_api": true, "send_back_text_in_streaming_api": false,
-      "dsl_query": "PERTANYAAN_DISINI", "version": "2.18"
-    },
-    "query_str": "PERTANYAAN_DISINI"
-  }' --max-time 30
-```
-**Parse response (Node.js):**
-```javascript
-// blocks[].diff_block.patches[].value.answer â€” atau streaming: patches[].value (string)
-// "text_completed": true menandai akhir respons utama
+  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36" \
+  -H "Accept: application/json, text/plain, */*" \
+  -H "Accept-Language: en-US,en;q=0.9" \
+  -H "Accept-Encoding: gzip, deflate, br" \
+  -H "Origin: https://target.com" \
+  -H "Referer: https://target.com/" \
+  -H "Sec-Ch-Ua: \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"" \
+  -H "Sec-Ch-Ua-Mobile: ?0" \
+  -H "Sec-Ch-Ua-Platform: \"Windows\"" \
+  -H "Sec-Fetch-Dest: empty" \
+  -H "Sec-Fetch-Mode: cors" \
+  -H "Sec-Fetch-Site: same-origin" \
+  -H "Connection: keep-alive"
 ```
 
-### PollinationsAI (belum diimplementasi)
+---
+
+### FASE 9 — Analisis GraphQL (jika website pakai GraphQL)
+
 ```bash
-curl -s -X POST "https://text.pollinations.ai/openai" \
+TARGET="https://target.com"
+TOKEN="..."
+
+# 1. Introspection query — dapatkan seluruh skema
+curl -s -X POST "$TARGET/graphql" \
   -H "Content-Type: application/json" \
-  -d '{"model":"openai","messages":[{"role":"user","content":"say hi"}],"stream":false}'
-# Atau: https://gen.pollinations.ai/v1/chat/completions (OpenAI-compatible langsung)
-# Models: openai, openai-fast, deepseek, mistral-small, llamascout, dll
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "query": "{ __schema { types { name kind fields { name type { name kind ofType { name kind } } } } } }"
+  }' | python3 -m json.tool | grep '"name"' | sort -u | head -50
+
+# 2. Temukan semua Query yang tersedia
+curl -s -X POST "$TARGET/graphql" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ __schema { queryType { fields { name description args { name type { name } } } } } }"}' \
+  | python3 -m json.tool
+
+# 3. Temukan semua Mutation
+curl -s -X POST "$TARGET/graphql" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ __schema { mutationType { fields { name description } } } }"}' \
+  | python3 -m json.tool
+
+# 4. Test query sederhana
+curl -s -X POST "$TARGET/graphql" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"query":"{ me { id email name } }"}' \
+  | python3 -m json.tool
 ```
 
-### Z.ai / chat.z.ai (GLM-5.1 â€” blocked, butuh X-Signature)
-```bash
-# Guest token gratis
-curl -s "https://chat.z.ai/api/v1/auths/" \
-  -H "User-Agent: Mozilla/5.0 Chrome/138.0.0.0" -H "Accept: application/json"
-# Response: {"token":"eyJ...","role":"guest","email":"guest-{timestamp}@guest.com"}
-# âš ï¸ Chat DIBLOKIR untuk guest â€” /openai/v1/chat/completions butuh X-Signature (HMAC)
-# Status: Perlu reverse-engineer signature algorithm dari JS bundle untuk bypass
+---
+
+### FASE 10 — Dokumentasi Hasil Recon
+
+Setelah selesai recon, dokumentasikan:
+
+```markdown
+## Hasil Recon: target.com
+
+### Tech Stack
+- Frontend: Next.js / React
+- Hosting: Vercel
+- CDN: Cloudflare
+- Backend: Node.js Express / Python FastAPI / etc
+
+### Auth Mechanism
+- Tipe: Bearer JWT / Cookie / API Key
+- Cara dapat token: POST /api/auth/login dengan email+password
+- Token TTL: ~24 jam (dari JWT exp field)
+- Refresh: POST /api/auth/refresh dengan refresh_token
+
+### Endpoint Utama
+| Endpoint | Method | Auth | Deskripsi |
+|---|---|---|---|
+| /api/search | GET | ❌ | Search publik |
+| /api/user/me | GET | ✅ Bearer | Profile user |
+| /api/posts | POST | ✅ Bearer | Buat post baru |
+
+### Format Request
+- Content-Type: application/json
+- Wajib header: User-Agent Chrome, Origin, Referer
+
+### Format Response
+- JSON standar dengan field: data, meta, error
+- Pagination: cursor-based via `cursor` field
+
+### Proteksi yang Ada
+- Cloudflare → bypass dengan --tlsv1.3
+- Rate limit: ~100 req/menit per IP
+- CSRF token di form (tidak di JSON API)
+
+### Catatan Khusus
+- Model/versi API: v2 lebih stabil dari v1
+- Ada endpoint undocumented: /api/internal/... (dari JS bundle)
 ```
 
 ---
 
 ## Tips Penting
 
-1. **Selalu gunakan Node.js 20+ untuk `crypto.randomUUID()`** â€” dibutuhkan untuk generate UUID session
-2. **Cache token dengan TTL** â€” jangan fetch ulang tiap request, gunakan TTL ~1 jam
-3. **Gunakan `execSync` curl bukan `fetch`** â€” untuk provider yang memerlukan TLS fingerprint Chrome
-4. **Parse SSE dengan hati-hati** â€” beberapa provider kirim format non-standar
-5. **Test dulu dengan curl** sebelum implement di TypeScript â€” lebih cepat iterasi
-6. **Perhatikan header `x-process-time: 0`** â€” berarti 404 dari CDN/nginx, bukan dari app backend
-7. **Model ID bisa berbeda** dari nama yang ditampilkan di UI â€” selalu ambil dari `/api/models`
-8. **Vision fallback via `flattenVisionMessages()`** sudah ada di `v1.ts` â€” tinggal panggil sebelum kirim ke provider yang tidak support native vision
-9. **Tool calling via prompt injection** sudah ada di `injectToolPrompt()` dan `detectToolCalls()` di `v1.ts` â€” tidak perlu implement ulang
+1. **Selalu mulai dari robots.txt dan sitemap.xml** — sering ada petunjuk path yang tidak terdaftar di navigasi.
+2. **Cek Network tab DevTools lebih dulu** dari curl — lebih cepat untuk memahami flow auth.
+3. **Copy as cURL dari DevTools** adalah cara tercepat mendapat request yang valid untuk direplikasi.
+4. **Decode JWT** untuk pahami field yang tersedia dan TTL token.
+5. **Gunakan `python3 -m json.tool`** untuk pretty-print JSON response di terminal.
+6. **Simpan cookie ke file** (`-c cookies.txt`) lalu reuse (`-b cookies.txt`) untuk session-based auth.
+7. **Perhatikan `X-Request-ID`, `X-Trace-ID`** — beberapa server butuh UUID ini di header.
+8. **Cari versi API** di JS bundle — `/v2/` mungkin tidak diumumkan tapi lebih stabil/lengkap.
+9. **Test payload minimal** dulu — tambah field satu per satu sampai dapat response yang benar.
+10. **Cek response header `X-RateLimit-*`** untuk tahu berapa limit yang berlaku.
 
-## Referensi
+## Tools yang Berguna
 
-- gpt4free repo: https://github.com/xtekky/gpt4free
-- Implementasi Perplexity: `g4f/Provider/Perplexity.py`
-- Implementasi PollinationsAI: `g4f/Provider/PollinationsAI.py`
-- Implementasi OperaAria: `g4f/Provider/OperaAria.py`
-- Standard OpenAI API reference: https://platform.openai.com/docs/api-reference/chat
+```bash
+# Pretty print JSON
+echo '{"key":"val"}' | python3 -m json.tool
+
+# Decode JWT
+TOKEN="eyJ..."
+echo "$TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null
+
+# Generate UUID
+python3 -c "import uuid; print(uuid.uuid4())"
+
+# URL encode
+python3 -c "import urllib.parse; print(urllib.parse.quote('hello world'))"
+
+# Extract cookies dari curl verbose
+curl -v "https://target.com" 2>&1 | grep "Set-Cookie"
+
+# Follow redirects dan lihat tiap hop
+curl -sL -D - "https://target.com/api/redirect" -o /dev/null
+
+# Test dengan timeout ketat
+curl -s --max-time 5 --connect-timeout 3 "https://target.com/api/test"
+```
