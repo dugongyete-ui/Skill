@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "towiAJUleApW69SV80hrl"
+uri = "file://apikeys.md"
+type = "text"
+title = "DramaBos API Keys"
