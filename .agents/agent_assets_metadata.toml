@@ -6,3 +6,9 @@ id = "towiAJUleApW69SV80hrl"
 uri = "file://apikeys.md"
 type = "text"
 title = "DramaBos API Keys"
+
+[[outputs]]
+id = "9LjU-bQh8sL8eRsTKsGYr"
+uri = "file://GOODSHORT_API_INTEGRATION.md"
+type = "text"
+title = "GoodShort API — Panduan Integrasi Web"
